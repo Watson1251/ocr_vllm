@@ -13,6 +13,7 @@ from src.models.layout_detector import LayoutRegion
 class OCRResult:
     text: str
     region: LayoutRegion
+    lang: Optional[str] = None
 
 
 class OCREngine:
@@ -31,7 +32,12 @@ class OCREngine:
         # fallback
         return "6"
 
-    def ocr_region(self, image_bgr: np.ndarray, region: LayoutRegion) -> OCRResult:
+    def ocr_region(
+        self,
+        image_bgr: np.ndarray,
+        region: LayoutRegion,
+        lang: Optional[str] = None,
+    ) -> OCRResult:
         x1, y1, x2, y2 = map(int, region.bbox)
         crop = image_bgr[y1:y2, x1:x2]
 
@@ -40,8 +46,8 @@ class OCREngine:
 
         text = pytesseract.image_to_string(
             crop,
-            lang=self.cfg.ocr.lang,
+            lang=lang or self.cfg.ocr.lang,
             config=config,
         )
 
-        return OCRResult(text=text.strip(), region=region)
+        return OCRResult(text=text.strip(), region=region, lang=lang or self.cfg.ocr.lang)

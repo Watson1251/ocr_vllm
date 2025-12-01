@@ -1,0 +1,24 @@
+{
+  "input": "/home/developer/Desktop/ocr_vllm/data/arabic2.png",
+  "num_pages": 1,
+  "pages": [
+    {
+      "page_num": 1,
+      "regions": [
+        {
+          "bbox": [
+            0.0,
+            0.0,
+            839.0,
+            488.0
+          ],
+          "score": 0.23513804376125336,
+          "doclaynet_label": "picture",
+          "type": "figure",
+          "text": "",
+          "lang": "ara"
+        }
+      ]
+    }
+  ]
+}

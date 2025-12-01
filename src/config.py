@@ -5,9 +5,9 @@ from pydantic import BaseModel
 
 
 class LayoutConfig(BaseModel):
-    model_path: str = "weights/yolov10n-doclaynet.pt"
-    img_size: int = 1024  # bump for better small-object recall
-    conf_th: float = 0.01  # minimum threshold to keep all candidates
+    model_path: str = "weights/yolov10m-doclaynet.pt"
+    img_size: int = 1280  # bump for better small-object recall
+    conf_th: float = 0.05  # pair with larger model
     iou_th: float = 0.4
     device: str = "0"  # we keep this CPU for now
 

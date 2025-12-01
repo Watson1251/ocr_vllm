@@ -18,7 +18,6 @@ echo "→ yolov10s-doclaynet.pt"
 wget -O "$WEIGHTS_DIR/yolov10s-doclaynet.pt" \
   "${BASE_URL}/yolov10s-doclaynet.pt?download=1"
 
-# (Optional) Medium model – uncomment if you want it
 echo "→ yolov10m-doclaynet.pt"
 wget -O "$WEIGHTS_DIR/yolov10m-doclaynet.pt" \
   "${BASE_URL}/yolov10m-doclaynet.pt?download=1"

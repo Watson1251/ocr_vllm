@@ -19,35 +19,44 @@ TYPE_COLORS = {
     "other": (180, 180, 180),
 }
 
+MIN_AREA = 80.0  # min area for boxes to keep
+MIN_SIDE = 6.0  # min width/height for boxes to keep
+
 
 def process_page_image(
     image_path: str,
     cfg: AppConfig,
     layout_detector: LayoutDetector,
     ocr_engine,
+    lang_detector,
 ) -> Dict[str, Any]:
     img_bgr = load_image_bgr(image_path)
 
     regions: List[LayoutRegion] = layout_detector.detect(img_bgr)
 
     # drop tiny boxes that cannot contain text/numbers
-    # regions = _filter_too_small(regions, min_area=10.0, min_side=6.0)
+    regions = _filter_too_small(regions, min_area=MIN_AREA, min_side=MIN_SIDE)
 
-    # sort by reading order: top then left
+    # # sort by reading order: top then left
     regions.sort(key=lambda r: (r.bbox[1], r.bbox[0]))
 
-    # regions = _suppress_overlaps(regions, iou_threshold=0.5)
-    # regions = _resolve_inline_overlaps(regions)
-    regions = _filter_empty_boxes(regions, img_bgr, ink_ratio_threshold=0.05)
-    # regions = _remove_nested_small(regions, area_ratio_threshold=0.08)
+    regions = _suppress_overlaps(regions, iou_threshold=0.35)
+    regions = _resolve_inline_overlaps(regions)
+    regions = _filter_empty_boxes(regions, img_bgr, ink_ratio_threshold=0.02)
+    regions = _remove_nested_small(regions, area_ratio_threshold=0.08)
     regions = _expand_boxes(
         regions,
         img_bgr,
-        padding=50,
-        ink_ratio_threshold=0.01,
+        padding=300,
+        ink_ratio_threshold=0.008,
+        shrink_white_threshold=0.99,
     )
+    # second pass after expansion to clean up remaining overlaps/empties
+    regions = _suppress_overlaps(regions, iou_threshold=0.25)
+    regions = _resolve_inline_overlaps(regions)
+    regions = _filter_empty_boxes(regions, img_bgr, ink_ratio_threshold=0.02)
     # final guard against tiny boxes introduced by trimming
-    # regions = _filter_too_small(regions, min_area=120.0, min_side=8.0)
+    regions = _filter_too_small(regions, min_area=MIN_AREA, min_side=MIN_SIDE)
 
     detections: List[Dict[str, Any]] = []
     annotated = img_bgr.copy()
@@ -57,8 +66,21 @@ def process_page_image(
         color = TYPE_COLORS.get(region.region_type, (0, 200, 0))
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 1)
+        label = region.label
+        score = str(round(region.score, 3))
+        cv2.putText(
+            annotated,
+            label,
+            (x1, max(0, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
-        # ocr_res = ocr_engine.ocr_region(img_bgr, region)
+        detected_lang, lang_conf = lang_detector.detect(img_bgr[y1:y2, x1:x2])
+        # ocr_res = ocr_engine.ocr_region(img_bgr, region, lang=detected_lang)
 
         detections.append(
             {
@@ -66,7 +88,9 @@ def process_page_image(
                 "score": float(region.score),
                 "doclaynet_label": region.label,
                 "type": region.region_type,
-                "text": '' #ocr_res.text,
+                "text": "", #ocr_res.text,
+                "lang": detected_lang,
+                "lang_conf": lang_conf,
             }
         )
 
@@ -79,15 +103,15 @@ def process_page_image(
 
 def _suppress_overlaps(regions: List[LayoutRegion], iou_threshold: float = 0.5) -> List[LayoutRegion]:
     """
-    Suppress overlapping/contained boxes: keep the higher-priority/score box when IoU exceeds threshold
-    or one box is fully contained within another.
+    Suppress overlapping/contained boxes: keep the higher-confidence/larger box (with header/footer priority)
+    when IoU exceeds threshold or one box is fully contained within another.
     """
     kept: List[LayoutRegion] = []
 
     def priority(r: LayoutRegion) -> float:
         # Prefer page headers/footers over text in the same row, then score.
         base = 2.0 if r.region_type == "page_meta" or r.label in {"page-header", "page-footer"} else 1.0
-        return base + r.score * 0.1
+        return base + r.score
 
     def area(r: LayoutRegion) -> float:
         x1, y1, x2, y2 = r.bbox
@@ -123,11 +147,14 @@ def _suppress_overlaps(regions: List[LayoutRegion], iou_threshold: float = 0.5) 
             contained = contains(region, kept_region) or contains(kept_region, region)
 
             if overlap or contained:
-                # keep higher priority; then larger area; then higher score
-                if priority(region) > priority(kept_region) or (
-                    priority(region) == priority(kept_region)
-                    and ((r_area > k_area) or (r_area == k_area and region.score > kept_region.score))
-                ):
+                pr = priority(region)
+                pk = priority(kept_region)
+                better_region = (
+                    (pr > pk)
+                    or (pr == pk and region.score > kept_region.score)
+                    or (pr == pk and region.score == kept_region.score and r_area > k_area)
+                )
+                if better_region:
                     kept.pop(idx)
                     # continue checking against other kept boxes
                     continue
@@ -143,11 +170,10 @@ def _suppress_overlaps(regions: List[LayoutRegion], iou_threshold: float = 0.5) 
 def _resolve_inline_overlaps(
     regions: List[LayoutRegion],
     vertical_overlap: float = 0.3,
-    min_side: float = 8.0,
 ) -> List[LayoutRegion]:
     """
-    For boxes that share a row (sufficient vertical overlap), force them to not overlap horizontally.
-    Use confidence/priority to decide which box keeps more width; the other is trimmed to start after it.
+    For boxes that share a row (sufficient vertical overlap), merge overlapping boxes
+    instead of trimming/dropping them. Merge keeps the higher-priority label/score.
     """
     if not regions:
         return regions
@@ -163,7 +189,6 @@ def _resolve_inline_overlaps(
         return inter >= vertical_overlap * min(ay2 - ay1, by2 - by1)
 
     adjusted = regions[:]
-    to_remove = set()
     # group by rows
     rows: List[List[LayoutRegion]] = []
     for r in adjusted:
@@ -176,32 +201,34 @@ def _resolve_inline_overlaps(
         if not placed:
             rows.append([r])
 
+    resolved: List[LayoutRegion] = []
     for row in rows:
         row.sort(key=lambda r: r.bbox[0])
-        for i in range(len(row) - 1):
-            current = row[i]
-            nxt = row[i + 1]
-            if nxt.bbox[0] < current.bbox[2]:
-                # overlap horizontally; trim the lower-priority one
-                if priority(current) >= priority(nxt):
-                    new_nx1 = current.bbox[2] + 1.0
-                    # avoid inversion
-                    if new_nx1 >= nxt.bbox[2]:
-                        new_nx1 = min(nxt.bbox[2] - 1.0, new_nx1)
-                    if (nxt.bbox[2] - new_nx1) < min_side:
-                        to_remove.add(id(nxt))
-                    else:
-                        nxt.bbox = (new_nx1, nxt.bbox[1], nxt.bbox[2], nxt.bbox[3])
-                else:
-                    new_cx2 = nxt.bbox[0] - 1.0
-                    if new_cx2 <= current.bbox[0]:
-                        new_cx2 = max(current.bbox[0] + 1.0, new_cx2)
-                    if (new_cx2 - current.bbox[0]) < min_side:
-                        to_remove.add(id(current))
-                    else:
-                        current.bbox = (current.bbox[0], current.bbox[1], new_cx2, current.bbox[3])
+        merged_row: List[LayoutRegion] = []
+        for r in row:
+            if not merged_row:
+                merged_row.append(r)
+                continue
+            prev = merged_row[-1]
+            # If overlap horizontally, merge to a union box
+            if r.bbox[0] < prev.bbox[2]:
+                new_x1 = min(prev.bbox[0], r.bbox[0])
+                new_y1 = min(prev.bbox[1], r.bbox[1])
+                new_x2 = max(prev.bbox[2], r.bbox[2])
+                new_y2 = max(prev.bbox[3], r.bbox[3])
+                # choose attributes from higher priority
+                chosen = prev if priority(prev) >= priority(r) else r
+                merged_row[-1] = LayoutRegion(
+                    bbox=(new_x1, new_y1, new_x2, new_y2),
+                    score=max(prev.score, r.score),
+                    label=chosen.label,
+                    region_type=chosen.region_type,
+                )
+            else:
+                merged_row.append(r)
+        resolved.extend(merged_row)
 
-    return [r for r in adjusted if id(r) not in to_remove]
+    return resolved
 
 
 def _remove_nested_small(
@@ -285,12 +312,14 @@ def _filter_too_small(
 def _expand_boxes(
     regions: List[LayoutRegion],
     img_bgr: np.ndarray,
-    padding: int = 32,
-    ink_ratio_threshold: float = 0.003,
+    padding: int = 60,
+    ink_ratio_threshold: float = 0.001,
+    shrink_white_threshold: float = 0.995,
 ) -> List[LayoutRegion]:
     """
-    First expand each box up to the maximum allowed margin (bounded by neighbors/image),
-    then shrink back per-side if the added margin is mostly non-text (very light pixels).
+    Expand boxes outward per-side when the margin contains ink, respecting
+    neighbors/image bounds. Then shrink back ONLY inside the added margin,
+    never inside the original detection box.
     """
     height, width = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -312,13 +341,27 @@ def _expand_boxes(
         dark = (band < 240).sum()
         return dark / band.size
 
+    def white_ratio(band: np.ndarray) -> float:
+        if band.size == 0:
+            return 1.0
+        return (band >= 240).sum() / band.size
+
     for i, region in enumerate(regions):
+        # original box
         x1, y1, x2, y2 = region.bbox
+
+        # safety clamp in case detector produced coordinates outside image
+        x1 = max(0.0, min(float(width), x1))
+        x2 = max(0.0, min(float(width), x2))
+        y1 = max(0.0, min(float(height), y1))
+        y2 = max(0.0, min(float(height), y2))
+
         left_allow = min(padding, x1)
         right_allow = min(padding, width - x2)
         up_allow = min(padding, y1)
         down_allow = min(padding, height - y2)
 
+        # respect neighboring boxes
         for j, other in enumerate(regions):
             if i == j:
                 continue
@@ -332,27 +375,71 @@ def _expand_boxes(
                 up_allow = min(up_allow, max(0.0, y1 - oy2 - 1))
                 down_allow = min(down_allow, max(0.0, oy1 - y2 - 1))
 
-        # expand to max allowed first
-        max_x1 = max(0.0, x1 - left_allow)
-        max_y1 = max(0.0, y1 - up_allow)
-        max_x2 = min(float(width - 1), x2 + right_allow)
-        max_y2 = min(float(height - 1), y2 + down_allow)
+        expand_left = expand_right = expand_up = expand_down = 0.0
 
-        # measure ink in the added margins
-        left_band = gray[int(max_y1) : int(max_y2), int(max_x1) : int(x1)]
-        right_band = gray[int(max_y1) : int(max_y2), int(x2) : int(max_x2)]
-        top_band = gray[int(max_y1) : int(y1), int(max_x1) : int(max_x2)]
-        bottom_band = gray[int(y2) : int(max_y2), int(max_x1) : int(max_x2)]
+        # decide which sides to expand based on ink in the margin bands
+        if left_allow > 0:
+            band = gray[int(y1): int(y2), int(max(0, x1 - left_allow)): int(x1)]
+            if band_ink_ratio(band) >= ink_ratio_threshold:
+                expand_left = left_allow
+        if right_allow > 0:
+            band = gray[int(y1): int(y2), int(x2): int(min(width, x2 + right_allow))]
+            if band_ink_ratio(band) >= ink_ratio_threshold:
+                expand_right = right_allow
+        if up_allow > 0:
+            band = gray[int(max(0, y1 - up_allow)): int(y1),
+                        int(max(0, x1 - expand_left)): int(min(width, x2 + expand_right))]
+            if band_ink_ratio(band) >= ink_ratio_threshold:
+                expand_up = up_allow
+        if down_allow > 0:
+            band = gray[int(y2): int(min(height, y2 + down_allow)),
+                        int(max(0, x1 - expand_left)): int(min(width, x2 + expand_right))]
+            if band_ink_ratio(band) >= ink_ratio_threshold:
+                expand_down = down_allow
 
-        shrink_left = 0.0 if band_ink_ratio(left_band) >= ink_ratio_threshold else left_allow
-        shrink_right = 0.0 if band_ink_ratio(right_band) >= ink_ratio_threshold else right_allow
-        shrink_up = 0.0 if band_ink_ratio(top_band) >= ink_ratio_threshold else up_allow
-        shrink_down = 0.0 if band_ink_ratio(bottom_band) >= ink_ratio_threshold else down_allow
+        # tentative expanded box
+        new_x1 = max(0.0, x1 - expand_left)
+        new_y1 = max(0.0, y1 - expand_up)
+        new_x2 = min(float(width), x2 + expand_right)
+        new_y2 = min(float(height), y2 + expand_down)
 
-        new_x1 = max_x1 + shrink_left
-        new_y1 = max_y1 + shrink_up
-        new_x2 = max_x2 - shrink_right
-        new_y2 = max_y2 - shrink_down
+        # --- shrink ONLY the added margin, not the original box ---
+
+        # left margin shrink
+        while (new_x2 - new_x1) > 6 and new_x1 < x1:
+            band = gray[int(new_y1): int(new_y2),
+                        int(new_x1): int(min(width, new_x1 + 2))]
+            if white_ratio(band) >= shrink_white_threshold:
+                new_x1 += 1
+            else:
+                break
+
+        # right margin shrink
+        while (new_x2 - new_x1) > 6 and new_x2 > x2:
+            band = gray[int(new_y1): int(new_y2),
+                        int(max(0, new_x2 - 2)): int(new_x2)]
+            if white_ratio(band) >= shrink_white_threshold:
+                new_x2 -= 1
+            else:
+                break
+
+        # top margin shrink
+        while (new_y2 - new_y1) > 6 and new_y1 < y1:
+            band = gray[int(new_y1): int(min(height, new_y1 + 2)),
+                        int(new_x1): int(new_x2)]
+            if white_ratio(band) >= shrink_white_threshold:
+                new_y1 += 1
+            else:
+                break
+
+        # bottom margin shrink
+        while (new_y2 - new_y1) > 6 and new_y2 > y2:
+            band = gray[int(max(0, new_y2 - 2)): int(new_y2),
+                        int(new_x1): int(new_x2)]
+            if white_ratio(band) >= shrink_white_threshold:
+                new_y2 -= 1
+            else:
+                break
 
         expanded.append(
             LayoutRegion(
